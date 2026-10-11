@@ -1,0 +1,322 @@
+---
+title: "Untitled"
+author: "Siham Ibrahim"
+date: "2026-10-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+
+library(tidyverse)  
+library(lubridate)  
+
+south_origin  <- "LOUGHBOROUGH COMMONS"           # start of northbound trips
+north_origin  <- "NORTH BROADWAY TRANSIT CENTER"  # start of southbound trips
+gtc_stops     <- c("GRAND TRANSIT CENTER NB", "GRAND TRANSIT CENTER SB")
+reroute_start <- as.Date("2025-07-14")
+reroute_end   <- as.Date("2025-11-05")
+dir_colors    <- c(Northbound = "#2a78d6", Southbound = "#eb6834")
+
+dir.create("figures", showWarnings = FALSE)
+
+bus <- read_csv(
+  "clean_data.csv",
+  col_select = c(trip_id, date, route_direction_id, service_type_id,
+                 geo_node_name, latitude, longitude, boardings, alightings,
+                 arrival_time, departure_time, adherence)
+)
+nrow(bus)   # expect 2,926,157
+
+
+bus <- bus %>%
+  mutate(
+    direction = if_else(route_direction_id == 7, "Northbound", "Southbound"),
+    day_type  = case_when(service_type_id == 9 ~ "Weekday",
+                          service_type_id == 7 ~ "Saturday",
+                          TRUE                 ~ "Sunday/Holiday")
+  )
+
+
+origins <- bus %>%
+  filter((direction == "Northbound" & geo_node_name == south_origin) |
+         (direction == "Southbound" & geo_node_name == north_origin)) %>%
+  select(trip_id, date, direction, day_type,
+         depart_origin = departure_time, origin_adherence = adherence)
+
+gtc <- bus %>%
+  filter(geo_node_name %in% gtc_stops) %>%
+  select(trip_id, date,
+         arrive_gtc = arrival_time, depart_gtc = departure_time,
+         gtc_adherence = adherence)
+
+
+gtc_lat <- bus %>%
+  filter(geo_node_name %in% gtc_stops) %>%
+  group_by(direction) %>%
+  summarise(gtc_lat = first(latitude))
+
+riders <- bus %>%
+  left_join(gtc_lat, by = "direction") %>%
+  filter((direction == "Northbound" & latitude <= gtc_lat) |
+         (direction == "Southbound" & latitude >= gtc_lat)) %>%
+  group_by(trip_id, date) %>%
+  summarise(riders = sum(boardings + alightings), .groups = "drop")
+
+trips <- origins %>%
+  inner_join(gtc,    by = c("trip_id", "date")) %>%
+  left_join(riders,  by = c("trip_id", "date")) %>%
+  mutate(
+    travel_min     = (arrive_gtc - depart_origin) / 60,
+    scheduled_min  = ((depart_gtc + gtc_adherence) -
+                      (depart_origin + origin_adherence)) / 60,
+    hour           = floor(depart_origin / 3600),   # 24 = after midnight
+    start_late_min = -origin_adherence / 60
+  )
+
+
+trips <- trips %>%
+  filter(!is.na(travel_min)) %>%                       # missing GTC or origin time
+  filter(travel_min >= 0.5 * scheduled_min,
+         travel_min <= 3   * scheduled_min) %>%        # impossible times (16 trips)
+  filter(origin_adherence <= 600)                      # logged >10 min early (103 trips)
+
+count(trips, direction)   # expect Northbound 23,265 / Southbound 22,464 (45,729 total)
+
+
+
+noaa_url <- paste0(
+  "https://www.ncei.noaa.gov/access/services/data/v1?dataset=daily-summaries",
+  "&stations=USW00013994&startDate=2025-07-01&endDate=2026-06-30",
+  "&dataTypes=PRCP,SNOW,SNWD,TMAX,TMIN&units=standard&format=csv"
+)
+weather <- read_csv(noaa_url) %>%
+  transmute(date = DATE, prcp_in = PRCP, snow_in = SNOW,
+            snow_depth_in = SNWD, tmax_f = TMAX, tmin_f = TMIN)
+
+trips <- trips %>%
+  left_join(weather, by = "date") %>%
+  mutate(
+    weather_type = case_when(
+      snow_in > 0 | snow_depth_in > 0 ~ "Snow / snow on ground",
+      prcp_in >= 1                    ~ "Heavy rain (1+ in)",
+      prcp_in >= 0.25                 ~ "Moderate rain",
+      prcp_in >= 0.01                 ~ "Light rain",
+      TRUE                            ~ "Dry"),
+    weather_type = factor(weather_type, levels = c(
+      "Dry", "Light rain", "Moderate rain", "Heavy rain (1+ in)",
+      "Snow / snow on ground")),
+    temp_band = cut(tmax_f, breaks = c(-Inf, 32, 50, 70, 85, 92, Inf),
+                    labels = c("32F or below", "33-50F", "51-70F",
+                               "71-85F", "86-92F", "93F+"))
+  )
+
+# ---- 6. Relative travel time ------------------------------------------------
+
+trips <- trips %>%
+  group_by(direction, day_type, hour) %>%
+  mutate(relative_min = travel_min - median(travel_min)) %>%
+  ungroup()
+
+# Overall summary (expect NB median 25.5, 95th 31.8; SB median 21.0, 95th 26.6)
+trips %>%
+  group_by(direction) %>%
+  summarise(trips = n(), median = median(travel_min),
+            p90 = quantile(travel_min, 0.90), p95 = quantile(travel_min, 0.95))
+
+write_csv(trips, "trip_travel_times.csv")
+
+
+
+by_hour <- trips %>%
+  filter(day_type == "Weekday") %>%
+  group_by(direction, hour) %>%
+  filter(n() >= 30) %>%                       # skip hours with too few trips
+  summarise(p10 = quantile(travel_min, 0.10), p25 = quantile(travel_min, 0.25),
+            median = median(travel_min),
+            p75 = quantile(travel_min, 0.75), p90 = quantile(travel_min, 0.90),
+            scheduled = median(scheduled_min), .groups = "drop")
+
+fig3 <- ggplot(by_hour, aes(x = hour)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90, fill = direction), alpha = 0.15) +
+  geom_ribbon(aes(ymin = p25, ymax = p75, fill = direction), alpha = 0.35) +
+  geom_line(aes(y = median, color = direction), linewidth = 1) +
+  geom_step(aes(y = scheduled), linetype = "dashed", direction = "mid") +
+  facet_wrap(~ direction) +
+  scale_color_manual(values = dir_colors, guide = "none") +
+  scale_fill_manual(values = dir_colors, guide = "none") +
+  scale_x_continuous(breaks = seq(4, 24, 4),
+                     labels = sprintf("%02d:00", seq(4, 24, 4) %% 24)) +
+  labs(title = "Weekday travel time to GTC by departure hour",
+       subtitle = "Line = median; dark band = middle 50%; light band = middle 80%; dashed = schedule",
+       x = "Departure hour from origin", y = "Travel time (minutes)") +
+  theme_minimal(base_size = 12)
+ggsave("figures/fig03_travel_time_by_hour.png", fig3, width = 10, height = 4.5, dpi = 300)
+
+
+heatmap_data <- trips %>%
+  filter(hour %in% 5:24) %>%
+  mutate(weekday = wday(date, label = TRUE, week_start = 1)) %>%   # Mon ... Sun
+  group_by(direction, weekday, hour) %>%
+  summarise(median = median(travel_min), .groups = "drop")
+
+fig5 <- ggplot(heatmap_data, aes(x = hour, y = fct_rev(weekday), fill = median)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(median),
+                color = if_else(median > 23, "white", "black")), size = 3) +
+  scale_color_identity() +
+  scale_fill_gradient(low = "#cde2fb", high = "#0d366b", name = "Median\nminutes") +
+  facet_wrap(~ direction, ncol = 1) +
+  scale_x_continuous(breaks = 5:24, labels = sprintf("%02d", (5:24) %% 24),
+                     expand = c(0, 0)) +
+  labs(title = "Median travel time to GTC by day of week and departure hour",
+       x = "Departure hour from origin", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+ggsave("figures/fig05_heatmap_day_hour.png", fig5, width = 11, height = 6, dpi = 300)
+
+
+fig8_data <- trips %>%
+  mutate(rider_group = cut(riders,
+                           breaks = c(0, 5, 10, 15, 20, 25, 30, 40, 50, 70, 100, Inf),
+                           right = FALSE,
+                           labels = c("0-4", "5-9", "10-14", "15-19", "20-24", "25-29",
+                                      "30-39", "40-49", "50-69", "70-99", "100+"))) %>%
+  group_by(direction, rider_group) %>%
+  filter(n() >= 30)
+
+fig8 <- ggplot(fig8_data, aes(x = rider_group, y = travel_min, fill = direction)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ direction, scales = "free_x") +
+  scale_fill_manual(values = dir_colors, guide = "none") +
+  coord_cartesian(ylim = c(12, 40)) +
+  labs(title = "Travel time rises with passenger activity",
+       x = "Passengers boarding + alighting between origin and GTC",
+       y = "Travel time to GTC (minutes)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("figures/fig08_travel_time_vs_riders.png", fig8, width = 10, height = 4.5, dpi = 300)
+
+cor(trips$riders, trips$travel_min, use = "complete.obs")   # about 0.5
+
+
+scenarios <- trips %>%
+  mutate(scenario = case_when(
+    day_type == "Weekday"        & hour %in% 5:6   ~ "Weekday 05-06",
+    day_type == "Weekday"        & hour %in% 7:8   ~ "Weekday 07-08 (AM peak)",
+    day_type == "Weekday"        & hour %in% 11:13 ~ "Weekday 11-13 (midday)",
+    day_type == "Weekday"        & hour %in% 15:17 ~ "Weekday 15-17 (PM peak)",
+    day_type == "Weekday"        & hour %in% 19:22 ~ "Weekday 19-22 (evening)",
+    day_type == "Saturday"       & hour %in% 11:17 ~ "Saturday 11-17",
+    day_type == "Sunday/Holiday" & hour %in% 11:17 ~ "Sunday 11-17")) %>%
+  filter(!is.na(scenario)) %>%
+  mutate(scenario = factor(scenario, levels = c(
+    "Weekday 05-06", "Weekday 07-08 (AM peak)", "Weekday 11-13 (midday)",
+    "Weekday 15-17 (PM peak)", "Weekday 19-22 (evening)",
+    "Saturday 11-17", "Sunday 11-17"))) %>%
+  group_by(direction, scenario) %>%
+  summarise(trips = n(),
+            p05 = quantile(travel_min, 0.05), p25 = quantile(travel_min, 0.25),
+            median = median(travel_min),
+            p75 = quantile(travel_min, 0.75), p95 = quantile(travel_min, 0.95),
+            .groups = "drop")
+write_csv(scenarios, "table_scenario_percentiles.csv")
+scenarios   # e.g. NB weekday AM peak: median 26.6, p95 32.8
+
+fig9 <- ggplot(scenarios, aes(y = fct_rev(scenario), color = direction)) +
+  geom_linerange(aes(xmin = p05, xmax = p95), linewidth = 1) +
+  geom_linerange(aes(xmin = p25, xmax = p75), linewidth = 4, alpha = 0.5) +
+  geom_point(aes(x = median), size = 3) +
+  facet_wrap(~ direction) +
+  scale_color_manual(values = dir_colors, guide = "none") +
+  labs(title = "How long the trip to GTC takes, by situation",
+       subtitle = "Dot = median; thick bar = middle 50%; thin line = 5th to 95th percentile",
+       x = "Travel time to GTC (minutes)", y = NULL) +
+  theme_minimal(base_size = 12)
+ggsave("figures/fig09_scenario_percentiles.png", fig9, width = 10, height = 4.5, dpi = 300)
+
+
+segment_time <- function(dir_label, from_stop, to_stop) {
+  start <- bus %>% filter(direction == dir_label, geo_node_name == from_stop) %>%
+    select(trip_id, date, t_start = departure_time)
+  end   <- bus %>% filter(direction == dir_label, geo_node_name == to_stop) %>%
+    select(trip_id, date, t_end = arrival_time)
+  inner_join(start, end, by = c("trip_id", "date")) %>%
+    mutate(segment_min = (t_end - t_start) / 60,
+           segment = paste0(dir_label, ": ", from_stop, " to ", to_stop))
+}
+
+segments <- bind_rows(
+  segment_time("Southbound", "GRAND @ CASS SB",    "GRAND @ LINDELL SB"),
+  segment_time("Northbound", "GRAND @ LINDELL NB", "GRAND @ DR ML KING NB")
+) %>%
+  filter(between(segment_min, 0.5, 20)) %>%
+  mutate(week = floor_date(date, "week"))
+
+segments %>%   # expect NB 4.2 during vs 2.7 after; SB 4.5 vs 3.8
+  mutate(period = if_else(date >= reroute_start & date <= reroute_end,
+                          "During reroute", "Other")) %>%
+  group_by(segment, period) %>%
+  summarise(median_min = median(segment_min), .groups = "drop")
+
+weekly_segments <- segments %>%
+  group_by(segment, week) %>%
+  summarise(median_min = median(segment_min), .groups = "drop")
+
+fig10 <- ggplot(weekly_segments, aes(week, median_min, color = segment)) +
+  annotate("rect", xmin = reroute_start, xmax = reroute_end,
+           ymin = -Inf, ymax = Inf, fill = "grey85", alpha = 0.6) +
+  annotate("text", x = reroute_start + 5, y = 5.6, hjust = 0, size = 3.5,
+           label = "Reroute (Jul 14 - Nov 5, 2025)") +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("#2a78d6", "#eb6834"), name = NULL) +
+  scale_y_continuous(limits = c(0, 6)) +
+  labs(title = "The reroute lengthened the detoured stretch of Grand",
+       x = "Week", y = "Weekly median segment time (minutes)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+ggsave("figures/fig10_reroute_segment.png", fig10, width = 10, height = 4.5, dpi = 300)
+
+
+weather_summary <- bind_rows(
+  trips %>% group_by(direction, level = weather_type) %>%
+    summarise(p25 = quantile(relative_min, 0.25), median = median(relative_min),
+              p75 = quantile(relative_min, 0.75), days = n_distinct(date),
+              .groups = "drop") %>%
+    mutate(panel = "Daily precipitation"),
+  trips %>% group_by(direction, level = temp_band) %>%
+    summarise(p25 = quantile(relative_min, 0.25), median = median(relative_min),
+              p75 = quantile(relative_min, 0.75), days = n_distinct(date),
+              .groups = "drop") %>%
+    mutate(panel = "Daily high temperature")
+) %>%
+  mutate(level = factor(level, levels = c(levels(trips$weather_type),
+                                          levels(trips$temp_band))))
+weather_summary   # e.g. freezing days: NB median about -0.8 min
+
+fig12 <- ggplot(weather_summary, aes(x = level, y = median, color = direction)) +
+  geom_hline(yintercept = 0) +
+  geom_pointrange(aes(ymin = p25, ymax = p75),
+                  position = position_dodge(width = 0.4)) +
+  facet_wrap(~ panel, scales = "free_x") +
+  scale_color_manual(values = dir_colors, name = NULL) +
+  labs(title = "Weather and travel time to GTC",
+       subtitle = "Minutes slower (+) or faster (-) than a typical trip at the same hour; dot = median, bar = middle 50%",
+       x = NULL, y = "Relative travel time (minutes)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "bottom")
+ggsave("figures/fig12_weather.png", fig12, width = 11, height = 5, dpi = 300)
+
+```
+
+

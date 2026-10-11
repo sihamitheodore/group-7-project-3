@@ -1,0 +1,83 @@
+---
+title: "Clean Bus Stop Data"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+```{r params}
+input_file <- "70_grand_20250701-20260630.csv"
+
+output_file <- "clean_data.csv"
+```
+
+## Read in the original data
+
+```{r read-data}
+dat0 <- read.csv(input_file)
+
+# lowercase the column names
+colnames(dat0) <- tolower(colnames(dat0))
+```
+
+## Create a unique stop identifier
+
+```{r row-id}
+dat0$row_id <- as.numeric(as.factor(
+  paste(dat0$calendar_id, dat0$trip_id, dat0$geo_node_name)
+))
+```
+
+## Aggregate over unique row_ids
+
+```{r aggregate, message=FALSE}
+library(dplyr)
+
+dat1 <- dat0 %>%
+  group_by(row_id) %>%
+  summarize(
+    trip_id             = trip_id[1],
+    trip_sequence       = trip_sequence[1],
+    block_id            = block_id[1],
+    block_abbr          = block_abbr[1],
+    route_id            = route_id[1],
+    route_abbr          = route_abbr[1],
+    route_direction_id  = route_direction_id[1],
+    service_type_id     = service_type_id[1],
+    property_tag        = property_tag[1],
+    geo_node_id         = geo_node_id[1],
+    latitude            = latitude[1] / 10^7,
+    longitude           = longitude[1] / 10^7,
+    geo_node_name       = geo_node_name[1],
+    public_stop_number  = public_stop_number[1],
+    boardings           = sum(boardings),
+    alightings          = sum(alightings),
+    arrival_time        = actual_arrival_time[1],
+    departure_time      = actual_departure_time[1],
+    adherence           = adherence[1],
+    date                = date[1]
+  ) %>%
+  as.data.frame()
+```
+
+## Preview
+
+```{r preview}
+head(dat1)
+```
+
+## Write to a file
+
+```{r write-data}
+write.csv(dat1, row.names = FALSE, quote = FALSE, file = output_file)
+
+# confirm 
+normalizePath(output_file)
+```
